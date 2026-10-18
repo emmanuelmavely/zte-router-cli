@@ -1,0 +1,18 @@
+# Local credentials and secrets
+*.hash
+hash
+.env
+.env.*
+cookies.txt
+*.cookie
+
+# Output dumps and logs
+*.json
+*.log
+*.out
+report*.txt
+
+# OS / Editor files
+.DS_Store
+*~
+*.swp
