@@ -1,8 +1,12 @@
 # Local credentials and secrets
+.zte-hash
+.zte-hash.*
 *.hash
 hash
 .env
 .env.*
+password
+*.password
 cookies.txt
 *.cookie
 

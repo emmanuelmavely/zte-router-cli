@@ -14,6 +14,9 @@ set -o pipefail
 
 PROGRAM=${0##*/}
 VERSION="2.0.0"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SAVED_LOGIN="$SCRIPT_DIR/.zte-hash"
+RELOGIN=0
 
 IP=${ZTE_IP:-192.168.5.1}
 SCHEME=${ZTE_SCHEME:-http}
@@ -32,6 +35,8 @@ NO_COLOR=0
 HASH_FILE=${ZTE_HASH_FILE:-}
 HASH_FILE_EXPLICIT=0
 [[ -n ${ZTE_HASH_FILE:-} ]] && HASH_FILE_EXPLICIT=1
+PASSWORD=${ZTE_PASSWORD:-}
+PASSWORD_FILE=${ZTE_PASSWORD_FILE:-}
 
 HASH=${ZTE_HASH:-}
 JAR=
@@ -174,6 +179,15 @@ parse_options() {
         HASH_FILE_EXPLICIT=1
         shift 2
         ;;
+      --relogin)
+        RELOGIN=1
+        shift
+        ;;
+      --password-file)
+        (($# >= 2)) || usage_error "--password-file needs a path"
+        PASSWORD_FILE=$2
+        shift 2
+        ;;
       --json)
         JSON_OUTPUT=1
         shift
@@ -248,12 +262,12 @@ load_hash() {
   if [[ -z $HASH_FILE ]]; then
     local config_root=${XDG_CONFIG_HOME:-}
     [[ -n $config_root || -z ${HOME:-} ]] || config_root="$HOME/.config"
-    if [[ -n $config_root && -r "$config_root/zte/hash" ]]; then
+    if [[ -n $config_root && -f "$config_root/zte/hash" && -r "$config_root/zte/hash" ]]; then
       HASH_FILE="$config_root/zte/hash"
     fi
   fi
   if [[ -n $HASH_FILE ]]; then
-    if [[ -r $HASH_FILE ]]; then
+    if [[ -f $HASH_FILE && -r $HASH_FILE ]]; then
       IFS= read -r HASH < "$HASH_FILE" || true
       HASH=${HASH%$'\r'}
     elif ((HASH_FILE_EXPLICIT)); then
@@ -271,11 +285,41 @@ load_hash() {
   [[ -n $HASH ]] || die 'the hashed password is empty'
 }
 
+load_password() {
+  if [[ -n $PASSWORD ]]; then return 0; fi
+  if [[ -n $PASSWORD_FILE ]]; then
+    [[ -f $PASSWORD_FILE && -r $PASSWORD_FILE ]] || die "cannot read ZTE password file: $PASSWORD_FILE"
+    IFS= read -r PASSWORD < "$PASSWORD_FILE" || true
+    PASSWORD=${PASSWORD%$'\r'}
+  elif [[ -t 0 && -t 1 ]]; then
+    printf 'ZTE router password: ' >&2
+    IFS= read -r -s PASSWORD || true
+    printf '\n' >&2
+  else
+    die 'set ZTE_PASSWORD, set ZTE_PASSWORD_FILE, or use an interactive terminal'
+  fi
+  [[ -n $PASSWORD ]] || die 'the router password is empty'
+}
+
+save_generated_hash() {
+  local config_root=${XDG_CONFIG_HOME:-}
+  [[ -n $config_root || -z ${HOME:-} ]] || config_root="$HOME/.config"
+  [[ -n $config_root ]] || return 0
+  install -d -m 700 "$config_root/zte" || die 'could not create the private ZTE config directory'
+  local cache="$config_root/zte/hash" tmp
+  tmp=$(mktemp "$config_root/zte/.hash.XXXXXX") || die 'could not create the generated hash file'
+  chmod 600 "$tmp"
+  printf '%s\n' "$1" > "$tmp"
+  mv -f -- "$tmp" "$cache" || die 'could not save the generated hash'
+  chmod 600 "$cache"
+}
+
 cleanup() {
   if [[ -n $JAR && -e $JAR ]]; then
     rm -f -- "$JAR"
   fi
   HASH=
+  PASSWORD=
 }
 
 on_signal() {
@@ -300,15 +344,49 @@ json_is_valid() {
   jq -e 'type == "object" or type == "array"' >/dev/null 2>&1 <<<"$1"
 }
 
+fetch_login_salt() {
+  local response
+  response=$("${curl_args[@]}" -H "Referer: $BASE_URL/" --get \
+    --data-urlencode 'isTest=false' --data-urlencode 'multi_data=1' \
+    --data-urlencode 'cmd=LD' "$GET_URL") || die 'could not fetch the router login salt (LD)'
+  jq -er '.LD // empty' <<<"$response" || die 'router returned no login salt (LD)'
+}
+
 login() {
-  local response rc
-  load_hash
+  local response rc login_value ld generated=0 answer saved
+  if ((RELOGIN)); then
+    PASSWORD=
+    PASSWORD_FILE=
+    load_password
+    ld=$(fetch_login_salt) || return 1
+    login_value=$(sha256_upper "$(sha256_upper "$PASSWORD")${ld}")
+    generated=1
+  elif [[ -n $HASH || -n $HASH_FILE ]]; then
+    load_hash
+    login_value=$HASH
+  elif [[ -z $PASSWORD && -z $PASSWORD_FILE && -f $SAVED_LOGIN ]]; then
+    [[ -r $SAVED_LOGIN ]] || die 'saved login is unreadable; use --relogin'
+    saved=$(jq -er --arg router "$BASE_URL" 'select(.router == $router) | .hash | select(type == "string" and length > 0)' "$SAVED_LOGIN" 2>/dev/null) || saved=
+    if [[ -n $saved ]]; then
+      login_value=$saved
+    else
+      load_password
+      ld=$(fetch_login_salt) || return 1
+      login_value=$(sha256_upper "$(sha256_upper "$PASSWORD")${ld}")
+      generated=1
+    fi
+  else
+    load_password
+    ld=$(fetch_login_salt) || return 1
+    login_value=$(sha256_upper "$(sha256_upper "$PASSWORD")${ld}")
+    generated=1
+  fi
   if response=$(
     {
       # Keep the credential in curl's config stream rather than its argv.
       printf 'data-urlencode = "isTest=false"\n'
       printf 'data-urlencode = "goformId=LOGIN"\n'
-      printf 'data-urlencode = "password=%s"\n' "$HASH"
+      printf 'data-urlencode = "password=%s"\n' "$login_value"
     } | "${curl_args[@]}" -c "$JAR" -H "Referer: $BASE_URL/" --config - "$LOGIN_URL"
   ); then
     rc=0
@@ -317,7 +395,21 @@ login() {
     die "login request failed (curl exit $rc)"
   fi
   if ! json_is_valid "$response" || ! jq -e 'type == "object" and ((.result? == "success") or (.result? == 0) or (.result? == "0") or (.result? == true) or (has("result") | not))' >/dev/null 2>&1 <<<"$response"; then
-    die 'router rejected the login or returned an unexpected response'
+    die 'router rejected the login or returned an unexpected response; use --relogin to enter your web UI password again'
+  fi
+  if ((generated)) && [[ -t 0 ]]; then
+    printf 'Save login for next time on this computer? [y/N] ' >&2
+    IFS= read -r answer || answer=
+    if [[ $answer == y || $answer == Y || $answer == yes ]]; then
+      local tmp
+      tmp=$(mktemp "$SCRIPT_DIR/.zte-hash.XXXXXX") || die 'could not create saved login file'
+      if ! jq -n --arg router "$BASE_URL" --arg hash "$login_value" '{router:$router,hash:$hash}' > "$tmp"; then
+        rm -f -- "$tmp"
+        die 'could not write saved login'
+      fi
+      chmod 600 "$tmp" && mv -fT -- "$tmp" "$SAVED_LOGIN" || die 'could not save login'
+      printf 'Saved login to %s (private, mode 600).\n' "$SAVED_LOGIN" >&2
+    fi
   fi
 }
 
@@ -569,6 +661,15 @@ system_command() {
   local json
   if ! json=$(read_once "$SYSTEM_CMD"); then return 1; fi
   print_json "$json"
+}
+
+login_command() {
+  login
+  if ((JSON_OUTPUT)); then
+    jq -n --arg router "$BASE_URL" '{login:true,router:$router,message:"login succeeded"}'
+  else
+    printf '%s✓%s Login succeeded for %s\n' "$GREEN" "$RESET" "$BASE_URL"
+  fi
 }
 
 sms_command() {
@@ -951,6 +1052,8 @@ Connection and output options:
   --no-color                Disable terminal colors
   --hash-file FILE          Read the already-hashed router password from FILE
                             (auto-detects ~/.config/zte/hash when present)
+  --password-file FILE      Read plaintext and calculate the dynamic login value
+  --relogin                Ignore saved credentials and ask for the web UI password
   --dry-run                 Show a write plan without contacting the router
   --yes                     Skip the confirmation prompt for a write
   --unsafe                  Permit a form not in the known UI endpoint list
@@ -964,6 +1067,7 @@ Read-only commands:
   wifi-info                 Wi-Fi state, SSID and LAN information
   network-info              Dial, WAN, DNS and IP information
   system                    Firmware, thermal and power/restart settings
+  login                     Test login and exit without changing state
   devices                   Wi-Fi and wired clients
   sms                       SMS counters and storage totals
   query CMD                 Read an explicit comma-separated router command list
@@ -1030,6 +1134,7 @@ main() {
     wifi-info) wifi_info_command ;;
     network-info|network) network_info_command ;;
     system) system_command ;;
+    login) login_command ;;
     devices) devices_command ;;
     sms) sms_command ;;
     query) query_command "${ARGS[0]:-}" ;;

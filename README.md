@@ -1,5 +1,37 @@
 # ZTE Router CLI
 
+## Normal login — no credential files needed
+
+```bash
+./zte.sh login
+```
+
+At `ZTE router password:`, type the same password you use in the web UI.
+Typing is hidden. The CLI handles the router's hash calculation internally.
+After a successful password login it asks **Save login for next time? [y/N]**.
+Answer `y` to save only the generated hash in `.zte-hash` beside `zte.sh`,
+or press Enter to save nothing. The file is private (mode `600`), ignored by
+Git, and scoped to the router URL. Treat it like a password.
+Subsequent commands reuse it without asking for your password.
+
+To ignore saved credentials and enter your normal password again:
+
+```bash
+./zte.sh login --relogin
+```
+
+Answer `y` again to replace the saved login. To stop remembering login entirely,
+delete the `.zte-hash` file beside the script. A rejected saved login is not
+retried automatically; use `--relogin` instead.
+
+Existing default credential
+files are not automatically loaded. Environment variables and explicit
+`--password-file` / `--hash-file` options remain opt-in alternatives.
+
+Other commands prompt when no saved login exists, for example `./zte.sh status`.
+The login command tests authentication and exits; each later invocation
+authenticates separately. Temporary session cookies are removed on exit.
+
 A single-file Bash CLI for inspecting and safely operating a ZTE cellular
 router/modem through its local web UI API.
 
@@ -127,9 +159,9 @@ assume that a plain SHA-256 of the human password is sufficient: some firmware
 versions include a dynamic login value. The browser request is the reliable
 source.
 
-### Save it in the automatically detected file
+### Optional explicit static hash file
 
-The script looks for this file automatically:
+You may store a hash outside the repository at:
 
 ```text
 $XDG_CONFIG_HOME/zte/hash
@@ -160,6 +192,52 @@ stat -c '%A %a %n' "${XDG_CONFIG_HOME:-$HOME/.config}/zte/hash"
 ```
 
 Expected permissions are `-rw-------` or mode `600`.
+
+Use `--hash-file` to select this file explicitly. For normal interactive use,
+prefer `./zte.sh login` and its optional script-local saved login instead.
+A captured hash may become stale if the router's `LD` changes.
+
+### Let the CLI calculate the dynamic hash
+
+For the inspected firmware, the browser login value is:
+
+```text
+SHA256_HEX_UPPER(SHA256_HEX_UPPER(plaintext_password) + LD)
+```
+
+`LD` is fetched from the router with the unauthenticated `cmd=LD` request.
+`zte.sh` performs this calculation when `ZTE_PASSWORD` or
+`ZTE_PASSWORD_FILE` is configured:
+
+```bash
+install -d -m 700 "${XDG_CONFIG_HOME:-$HOME/.config}/zte"
+umask 077
+read -r -s -p 'Router password: ' ZTE_PASSWORD
+printf '\n'
+printf '%s\n' "$ZTE_PASSWORD" > "${XDG_CONFIG_HOME:-$HOME/.config}/zte/password"
+unset ZTE_PASSWORD
+chmod 600 "${XDG_CONFIG_HOME:-$HOME/.config}/zte/password"
+
+./zte.sh --password-file "${XDG_CONFIG_HOME:-$HOME/.config}/zte/password" status --redact
+
+# Alternatively, prompt for your password without a password file:
+./zte.sh login
+```
+
+After successful interactive password authentication, the CLI asks whether to
+save the generated value in `.zte-hash` beside the script. It never saves the
+plaintext password automatically. See the normal-login instructions above.
+
+You can also use the environment variable for one private shell session:
+
+```bash
+export ZTE_PASSWORD='use-your-password-locally'
+./zte.sh status --redact
+unset ZTE_PASSWORD
+```
+
+Do not commit the plaintext password file. Keep it outside the repository when
+possible.
 
 ### Use a different file
 
